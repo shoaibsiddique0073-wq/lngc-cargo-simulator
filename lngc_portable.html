@@ -1,0 +1,1115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>174k m3 LNGC Membrane Cargo &amp; Ballast Simulator</title>
+<style>
+  :root {
+    --bg: #070c14; --panel: #0e1726; --border: #1e2f4d;
+    --text: #d8e6f8; --muted: #7b93b2; --cyan: #00d4ff;
+    --green: #00e676; --amber: #ffab00; --red: #ff3d57;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: monospace; }
+  body { background: var(--bg); color: var(--text); padding: 8px; font-size: 13px; }
+  .topbar {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    justify-content: space-between; background: var(--panel);
+    border: 1px solid var(--border); padding: 8px 12px; border-radius: 4px;
+  }
+  .brand { font-size: 15px; font-weight: bold; color: var(--cyan); }
+  .telemetry-strip { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  .badge {
+    padding: 3px 8px; border-radius: 3px; font-weight: bold;
+    background: #132238; border: 1px solid var(--border);
+  }
+  .esd-ok { background: #06331e; color: var(--green); border-color: var(--green); }
+  .esd-trip { background: #4a0a14; color: #fff; border-color: var(--red); animation: blink 0.8s infinite; }
+  @keyframes blink { 50% { opacity: 0.35; } }
+  .navbar {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+    gap: 5px; margin: 8px 0;
+  }
+  button {
+    background: #132036; color: var(--text); border: 1px solid var(--border);
+    padding: 7px 6px; border-radius: 3px; cursor: pointer; font-weight: bold;
+  }
+  button:hover { border-color: var(--cyan); }
+  button.active { background: #00456b; border-color: var(--cyan); color: #fff; }
+  button.btn-danger { background: #520c18; border-color: var(--red); color: #fff; }
+  button.btn-ok { background: #0a3d24; border-color: var(--green); color: var(--green); }
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 10px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 8px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 4px; padding: 10px;
+  }
+  .card h3 { color: var(--cyan); font-size: 13px; margin-bottom: 8px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+  .kv { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px dashed #15233b; }
+  .kv span:last-child { font-weight: bold; color: #fff; }
+  .ctrl-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; }
+  input[type=range] { flex: 1; accent-color: var(--cyan); }
+  svg { width: 100%; height: auto; background: #060a10; border: 1px solid #16243b; border-radius: 4px; }
+  .alm-text { color: var(--red); font-weight: bold; }
+  .warn-text { color: var(--amber); font-weight: bold; }
+  .ok-text { color: var(--green); font-weight: bold; }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div>
+      <span class="brand">GTT MARK III FLEX &mdash; 174,000 m&sup3; LNGC SIMULATOR</span>
+      <span id="backend-tag" class="badge" style="margin-left:6px;">SYNCING</span>
+    </div>
+    <div class="telemetry-strip">
+      <span class="badge">TIME: <span id="tb-time">0.0</span>s</span>
+      <span class="badge">DOME AVG: <span id="tb-pdome">11.50</span> kPaG</span>
+      <span class="badge">ME FUEL: <span id="tb-mefuel">0.95</span> kg/s</span>
+      <span id="tb-esd" class="badge esd-ok">ESD-1: NORMAL</span>
+      <button class="btn-danger" onclick="sendCmd('esd=1')">ESD-1 TRIP</button>
+      <button class="btn-ok" onclick="sendCmd('esd=0')">RESET ESD</button>
+    </div>
+  </div>
+
+  <div class="navbar" id="navbar"></div>
+  <div id="viewport"></div>
+
+  <script>
+// LNGC Membrane Simulator - Serverless Fallback & C++20 Sync Engine (7-Bit ASCII)
+const P_ATM = 101.325, R_UNIV = 8.314462, MW_CH4 = 16.043, MW_N2 = 28.013, TB_CH4 = -161.52;
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+function pSatCh4Kpag(tC) {
+  const tK = clamp(tC + 273.15, 91.0, 190.0);
+  return Math.pow(10.0, 3.9895 - 443.028 / (tK - 0.49)) * 100.0 - P_ATM;
+}
+
+function tSatCh4C(pKpag) {
+  const pBar = Math.max(0.05, (pKpag + P_ATM) / 100.0);
+  return (443.028 / (3.9895 - Math.log10(pBar))) + 0.49 - 273.15;
+}
+
+function rhoLiquidLng(tC) {
+  return clamp(422.6 - 1.42 * (tC - TB_CH4), 380.0, 455.0);
+}
+
+function rhoVaporMix(pKpag, tC, xCh4) {
+  const xm = clamp(xCh4, 0.0, 1.0);
+  const mw = xm * MW_CH4 + (1.0 - xm) * MW_N2;
+  const pPa = Math.max(1000.0, (pKpag + P_ATM) * 1000.0);
+  const tK = Math.max(90.0, tC + 273.15);
+  const pBar = pPa / 1e5;
+  const z = clamp(1.0 - 0.032 * pBar * Math.pow(111.6 / tK, 1.6), 0.75, 1.0);
+  return (pPa * mw * 1e-3) / (z * R_UNIV * tK);
+}
+
+function hFgCh4(pKpag) {
+  return clamp(510.8 - 2.15 * (tSatCh4C(pKpag) - TB_CH4), 440.0, 535.0);
+}
+
+const CT_GEOM = [
+  { id: 1, maxVol: 36500, lcg: 84.0, vcg: 16.8, h: 33.5, area: 6200, maxIt: 58000 },
+  { id: 2, maxVol: 45800, lcg: 31.0, vcg: 16.5, h: 33.5, area: 7400, maxIt: 86000 },
+  { id: 3, maxVol: 45800, lcg: -24.0, vcg: 16.5, h: 33.5, area: 7400, maxIt: 86000 },
+  { id: 4, maxVol: 45900, lcg: -79.0, vcg: 16.6, h: 33.5, area: 7450, maxIt: 86000 }
+];
+
+const WBT_GEOM = [
+  { name: "WBT 1P", maxVol: 5400, lcg: 82.0, vcg: 8.5, tcg: -14.2, maxIt: 4200 },
+  { name: "WBT 1S", maxVol: 5400, lcg: 82.0, vcg: 8.5, tcg: 14.2, maxIt: 4200 },
+  { name: "WBT 2P", maxVol: 7200, lcg: 30.0, vcg: 7.8, tcg: -16.8, maxIt: 5600 },
+  { name: "WBT 2S", maxVol: 7200, lcg: 30.0, vcg: 7.8, tcg: 16.8, maxIt: 5600 },
+  { name: "WBT 3P", maxVol: 7200, lcg: -25.0, vcg: 7.8, tcg: -16.8, maxIt: 5600 },
+  { name: "WBT 3S", maxVol: 7200, lcg: -25.0, vcg: 7.8, tcg: 16.8, maxIt: 5600 },
+  { name: "WBT 4P", maxVol: 6800, lcg: -78.0, vcg: 8.2, tcg: -15.5, maxIt: 5100 },
+  { name: "WBT 4S", maxVol: 6800, lcg: -78.0, vcg: 8.2, tcg: 15.5, maxIt: 5100 },
+  { name: "FPK",    maxVol: 4500, lcg: 126.0, vcg: 12.0, tcg: 0.0, maxIt: 2900 },
+  { name: "APT",    maxVol: 3800, lcg: -131.0, vcg: 13.5, tcg: 0.0, maxIt: 3100 }
+];
+
+class StandaloneLNGCSim {
+  constructor() {
+    this.state = {
+      sim_time: 0.0, preset: 0, esd1: false, esd_reason: "NORMAL", me_fuel_kgs: 0.95,
+      hydro: { disp: 112000, df: 11.4, dm: 11.5, da: 11.6, trim: -0.2, gm: 4.8, fsc: 1.1, heel: 0.0, swsf: 4200, swbm: 125000, stress_alm: false },
+      manifold: { mode: 0, p_liq: 25.0, p_strip: 280.0, p_vap_ret: 18.0, t_vap_ret: -138.0, esd_liq_v: 100.0, esd_vap_v: 100.0, shore_liq_kgs: 0.0, shore_vap_kgs: 0.0, temp_trip: false },
+      gcu: { valve: 0.0, burn_kgs: 0.0, mw: 0.0, temp_c: 45.0 },
+      vap: { main_en: false, main_kgs: 0.0, main_t: -135.0, force_en: false, force_kgs: 0.0, desup_v: 35.0 },
+      comp: [
+        { run: true, hd: false, igv: 72.0, asv: 0.0, hp: 310.0, qa: 3200.0, q_surge: 1900.0, kgs: 1.10, t_dis: -32.0, kw: 450.0, surge: false },
+        { run: false, hd: false, igv: 70.0, asv: 0.0, hp: 0.0, qa: 0.0, q_surge: 1850.0, kgs: 0.0, t_dis: -90.0, kw: 0.0, surge: false },
+        { run: false, hd: true, igv: 85.0, asv: 0.0, hp: 0.0, qa: 0.0, q_surge: 7900.0, kgs: 0.0, t_dis: -105.0, kw: 0.0, surge: false },
+        { run: false, hd: true, igv: 85.0, asv: 0.0, hp: 0.0, qa: 0.0, q_surge: 7900.0, kgs: 0.0, t_dis: -105.0, kw: 0.0, surge: false }
+      ],
+      tanks: [0, 1, 2, 3].map(i => ({
+        id: i + 1, fill: 94.0, vol: CT_GEOM[i].maxVol * 0.94, mass: CT_GEOM[i].maxVol * 0.94 * 0.422,
+        p_dome: 11.5, t_liq: -161.2, t_vap: -148.0, t_mem: -160.5, cool_rate: 0.0, bor_kgs: 0.24,
+        p_is: 0.45, p_ibs: 0.60, is_ch4: 0.0, slosh: false, p1_amps: 0.0, p2_amps: 0.0, sp_amps: 0.0,
+        p1_run: false, p2_run: false, sp_run: false, fill_v: 0.0, spray_v: 0.0, leak: false, x_ch4: 0.998
+      })),
+      wbt_fill: [15, 15, 15, 15, 15, 15, 15, 15, 20, 35],
+      wbt_mode: 0, bpump: [false, false], motor_dp: 65.0, fire_temp: 32.0
+    };
+    this.loadPreset(0);
+  }
+
+  loadPreset(p) {
+    const s = this.state;
+    s.preset = p; s.esd1 = false; s.esd_reason = "NORMAL"; s.fire_temp = 32.0; s.motor_dp = 65.0;
+    s.manifold.mode = (p === 1) ? 1 : (p === 2 ? 2 : 0);
+    s.me_fuel_kgs = (p === 1) ? 0.15 : (p === 5 ? 0.0 : 0.95);
+    s.comp[0].run = true; s.comp[0].igv = 72.0; s.comp[1].run = false;
+    s.comp[2].run = (p === 1); s.comp[3].run = (p === 1);
+    s.vap.main_en = (p === 2); s.vap.force_en = false;
+    s.tanks.forEach((t, i) => {
+      t.fill = (p === 3 || p === 4 || p === 7) ? 3.5 : 94.0;
+      t.t_liq = -161.2; t.t_vap = (p === 3) ? -85.0 : -148.0; t.t_mem = t.t_vap;
+      t.p_dome = (p === 5) ? 16.2 : 11.5; t.x_ch4 = (p === 7) ? 0.05 : 0.998;
+      t.fill_v = (p === 1) ? 85.0 : 0.0; t.spray_v = (p === 3) ? 65.0 : 0.0;
+      t.p1_run = (p === 2); t.p2_run = (p === 2);
+      t.sp_run = (p === 1 || p === 2 || p === 3 || p === 4);
+      t.leak = (p === 6 && i === 1); t.is_ch4 = 0.0; t.p_is = 0.45; t.p_ibs = 0.60;
+      t.vol = CT_GEOM[i].maxVol * (t.fill / 100.0);
+      t.mass = t.vol * rhoLiquidLng(t.t_liq) / 1000.0;
+    });
+  }
+
+  step(dt) {
+    const s = this.state;
+    s.sim_time += dt;
+    let pHdr = 0, tHdr = 0, xHdr = 0, sumFillV = 0;
+    s.tanks.forEach(t => { pHdr += t.p_dome * 0.25; tHdr += t.t_vap * 0.25; xHdr += t.x_ch4 * 0.25; sumFillV += (t.fill_v || 0); });
+
+    s.comp.forEach((c, idx) => {
+      if (s.esd1 || pHdr <= 1.2) c.run = false;
+      if (!c.run) { c.hp = c.qa = c.kgs = c.kw = 0; c.surge = false; return; }
+      if (!c.hd) c.igv = clamp(c.igv + (pHdr - 11.5) * 4.0 * dt, 15.0, 100.0);
+      const p1 = Math.max(90.0, pHdr + P_ATM), p2 = (c.hd ? s.manifold.p_vap_ret : 650.0) + P_ATM;
+      const t1K = Math.max(100.0, tHdr + 273.15), rp = Math.max(1.05, p2 / p1);
+      c.hp = 0.92 * (R_UNIV / 16.2) * t1K * (1.38 / 0.38) * (Math.pow(rp, 0.38 / 1.38) - 1.0);
+      const igv = clamp(c.igv / 100.0, 0.15, 1.0), qMax = c.hd ? 18500.0 : 4800.0;
+      const hpMax = (c.hd ? 145.0 : 420.0) * (0.55 + 0.45 * igv);
+      c.q_surge = qMax * (0.28 + 0.18 * igv);
+      const qMap = qMax * igv * Math.sqrt(Math.max(0.0, 1.10 - clamp(c.hp / hpMax, 0.0, 1.08)));
+      const margin = (qMap - c.q_surge) / c.q_surge;
+      c.asv = clamp(c.asv + (margin < 0.12 ? (0.12 - margin) * 45.0 : -8.0) * dt, 0.0, 100.0);
+      const qAsv = (c.asv / 100.0) * c.q_surge * 0.95;
+      c.qa = qMap + qAsv; c.surge = c.qa < c.q_surge;
+      const rhoS = rhoVaporMix(pHdr, tHdr, xHdr);
+      c.kgs = Math.max(0.0, ((c.qa - qAsv) * rhoS) / 3600.0);
+      c.t_dis = t1K * Math.pow(rp, 0.38 / 1.38) - 273.15;
+      c.kw = (((c.qa * rhoS) / 3600.0) * c.hp) / 0.78;
+    });
+
+    const ldKgs = s.comp[0].kgs + s.comp[1].kgs, hdKgs = s.comp[2].kgs + s.comp[3].kgs;
+    s.vap.main_kgs = (s.vap.main_en && !s.esd1) ? 3.8 : 0.0;
+    s.vap.force_kgs = (s.vap.force_en && !s.esd1) ? 1.5 : 0.0;
+    const desupDrop = (s.vap.desup_v / 100.0) * 42.0;
+    s.manifold.t_vap_ret = (hdKgs > 0.05 ? ((s.comp[2].t_dis + s.comp[3].t_dis) * 0.5 - desupDrop) : -138.0);
+    s.manifold.temp_trip = (hdKgs > 0.1 && s.manifold.t_vap_ret > -120.0);
+
+    const excessBog = Math.max(0.0, ldKgs + s.vap.force_kgs - s.me_fuel_kgs);
+    s.gcu.valve = s.esd1 ? 0.0 : clamp(s.gcu.valve + (pHdr - 14.5) * 12.0 * dt, 0.0, 100.0);
+    s.gcu.burn_kgs = s.esd1 ? 0.0 : Math.max(excessBog, 1.35 * (s.gcu.valve / 100.0));
+    s.gcu.mw = s.gcu.burn_kgs * 50.0; s.gcu.temp_c = 65.0 + 280.0 * s.gcu.burn_kgs;
+
+    s.manifold.esd_liq_v = clamp(s.manifold.esd_liq_v + (s.esd1 ? -3.34 : 10.0) * dt, 0.0, 100.0);
+    s.manifold.esd_vap_v = clamp(s.manifold.esd_vap_v + (s.esd1 ? -3.34 : 10.0) * dt, 0.0, 100.0);
+    const cvL = s.manifold.esd_liq_v / 100.0, cvV = s.manifold.esd_vap_v / 100.0;
+
+    let totPumpKgs = 0;
+    s.tanks.forEach((t, i) => {
+      if (s.esd1) { t.p1_run = false; t.p2_run = false; t.sp_run = false; }
+      t.p1_amps = t.p1_run ? 610.0 : 0.0; t.p2_amps = t.p2_run ? 610.0 : 0.0; t.sp_amps = t.sp_run ? 38.0 : 0.0;
+      const pOutKgs = (t.p1_run ? 192.0 : 0.0) + (t.p2_run ? 192.0 : 0.0);
+      totPumpKgs += pOutKgs;
+      const qPumpKw = (t.p1_run ? 225.0 : 0.0) + (t.p2_run ? 225.0 : 0.0) + (t.sp_run ? 12.0 : 0.0);
+      const qHullKw = 0.145 * CT_GEOM[i].area * (0.25 + 0.75 * (t.fill / 100.0)) * (22.0 - t.t_liq) / 1000.0;
+      t.bor_kgs = (qHullKw + qPumpKw) / hFgCh4(t.p_dome);
+      const sprayKgs = (t.sp_run ? 1.4 * ((t.spray_v || 0) / 100.0) : 0.0);
+      const prevMem = t.t_mem;
+      t.t_mem += (((t.fill > 5.0 ? t.t_liq : t.t_vap - 18.0 * ((t.spray_v || 0) / 100.0)) - t.t_mem) * 0.015) * dt;
+      t.cool_rate = ((t.t_mem - prevMem) / Math.max(0.01, dt)) * 3600.0;
+
+      const liqIn = (s.manifold.mode === 1 && sumFillV > 0.1) ? (1150.0 * cvL * ((t.fill_v || 0) / sumFillV)) : 0.0;
+      const netLiq = liqIn - pOutKgs * cvL - t.bor_kgs;
+      const rhoL = rhoLiquidLng(t.t_liq);
+      t.mass = clamp(t.mass + (netLiq * dt) / 1000.0, 0.0, CT_GEOM[i].maxVol * 0.99 * rhoL / 1000.0);
+      t.vol = (t.mass * 1000.0) / rhoL; t.fill = (t.vol / CT_GEOM[i].maxVol) * 100.0;
+      const vUll = Math.max(150.0, CT_GEOM[i].maxVol - t.vol);
+      const vapDraw = (ldKgs + hdKgs * cvV + s.gcu.burn_kgs * 0.35) * 0.25;
+      const vapRet = (s.vap.main_kgs + s.vap.force_kgs) * 0.25;
+      const netVap = t.bor_kgs + vapRet + (netLiq / rhoL) * 1.8 - sprayKgs * 0.65 - vapDraw;
+      t.p_dome = clamp(t.p_dome + (netVap * dt / vUll) * 62.0, -5.0, 28.0);
+      if (t.leak) { t.p_is = clamp(t.p_is + 0.35 * dt, 0.2, 6.5); t.is_ch4 = clamp(t.is_ch4 + 2.4 * dt, 0.0, 85.0); }
+      else { t.p_is = 0.45; t.is_ch4 = Math.max(0.0, t.is_ch4 - 1.5 * dt); }
+      t.slosh = (t.fill >= 10.0 && t.fill <= 70.0);
+      if (!s.esd1 && (t.fill > 98.5 || t.p_dome <= 1.5 || t.is_ch4 > 30.0)) {
+        s.esd1 = true; s.esd_reason = "CT" + t.id + (t.fill > 98.5 ? " OVERFILL" : (t.p_dome <= 1.5 ? " LOW PRESS" : " BARRIER LEAK"));
+      }
+    });
+    s.manifold.shore_liq_kgs = (s.manifold.mode === 1) ? 1150.0 * cvL : (s.manifold.mode === 2 ? -totPumpKgs * cvL : 0.0);
+    s.manifold.shore_vap_kgs = hdKgs * cvV;
+    if (!s.esd1 && (s.manifold.temp_trip || s.fire_temp >= 104.0)) {
+      s.esd1 = true; s.esd_reason = s.fire_temp >= 104.0 ? "FIRE LOOP > 104C" : "SHORE VAPOR TEMP > -120C";
+    }
+  }
+}
+
+window.simEngine = new StandaloneLNGCSim();
+window.useBackend = false;
+
+function sendCmd(q) {
+  const s = window.simEngine.state, p = new URLSearchParams(q);
+  if (p.has("preset")) window.simEngine.loadPreset(parseInt(p.get("preset")));
+  if (p.has("esd")) { s.esd1 = p.get("esd") === "1"; if (s.esd1) s.esd_reason = "MANUAL CCR PUSHBUTTON"; else { s.esd_reason = "NORMAL"; s.fire_temp = 32.0; } }
+  if (p.has("op_mode")) s.manifold.mode = parseInt(p.get("op_mode"));
+  if (p.has("me_fuel")) s.me_fuel_kgs = parseFloat(p.get("me_fuel"));
+  if (p.has("desup")) s.vap.desup_v = parseFloat(p.get("desup"));
+  if (p.has("comp_tog")) { const c = parseInt(p.get("comp_tog")); s.comp[c].run = !s.comp[c].run; }
+  if (p.has("igv")) { const c = parseInt(p.get("comp")); s.comp[c].igv = parseFloat(p.get("igv")); }
+  if (p.has("vap_main")) s.vap.main_en = !s.vap.main_en;
+  if (p.has("vap_force")) s.vap.force_en = !s.vap.force_en;
+  if (p.has("pump_tog")) {
+    const t = s.tanks[parseInt(p.get("tank"))], pk = parseInt(p.get("pump_tog"));
+    if (pk === 0) t.p1_run = !t.p1_run; else if (pk === 1) t.p2_run = !t.p2_run; else t.sp_run = !t.sp_run;
+  }
+  if (p.has("fill_v")) s.tanks[parseInt(p.get("tank"))].fill_v = parseFloat(p.get("fill_v"));
+  if (p.has("spray_v")) s.tanks[parseInt(p.get("tank"))].spray_v = parseFloat(p.get("spray_v"));
+  if (p.has("leak_tog")) { const t = s.tanks[parseInt(p.get("tank"))]; t.leak = !t.leak; }
+  if (p.has("fire_sim")) s.fire_temp = 112.0;
+  fetch("/cmd?" + q).catch(() => {});
+}
+
+</script>
+  <script>
+// LNGC GTT Mark III Flex - 3D Ship, Trunk Deck, Piping & Manifold Renderer (7-Bit ASCII)
+window.lngc3D = {
+  yaw: -0.64, pitch: 0.40, zoom: 1.18, panX: 0, panY: 12,
+  viewMode: "ISO", // "ISO", "PROFILE", "PLAN", "XSECT"
+  showHull: true, showTrunk: true, showPipes: true, showWbt: true,
+  canvas: null, ctx: null, touchMode: "none",
+  lastX: 0, lastY: 0, pinchDist: 0, panLastX: 0, panLastY: 0, animPhase: 0.0
+};
+
+function setCamPreset(mode) {
+  const c = window.lngc3D;
+  c.viewMode = mode;
+  c.panX = 0; c.panY = 12;
+  if (mode === "ISO") { c.yaw = -0.64; c.pitch = 0.40; c.zoom = 1.18; }
+  else if (mode === "PROFILE") { c.yaw = 0.0; c.pitch = 0.04; c.zoom = 1.28; }
+  else if (mode === "PLAN") { c.yaw = 0.0; c.pitch = 1.56; c.zoom = 1.24; }
+  else if (mode === "XSECT") { c.zoom = 1.05; }
+  sync3DButtons();
+  draw3DHullFrame(window.latestState || window.simEngine.state);
+}
+
+function adjustZoom(delta) {
+  const c = window.lngc3D;
+  c.zoom = Math.max(0.45, Math.min(4.00, c.zoom + delta));
+  const sl = document.getElementById("zoom-slider-3d");
+  if (sl) sl.value = c.zoom.toFixed(2);
+  draw3DHullFrame(window.latestState || window.simEngine.state);
+}
+
+function toggle3DLayer(prop) {
+  window.lngc3D[prop] = !window.lngc3D[prop];
+  sync3DButtons();
+  draw3DHullFrame(window.latestState || window.simEngine.state);
+}
+
+function sync3DButtons() {
+  const c = window.lngc3D;
+  ["ISO", "PROFILE", "PLAN", "XSECT"].forEach(m => {
+    const b = document.getElementById("btn-cam-" + m);
+    if (b) b.className = (c.viewMode === m) ? "active" : "";
+  });
+  const map = { showHull: "btn-lay-hull", showTrunk: "btn-lay-trunk", showPipes: "btn-lay-pipes", showWbt: "btn-lay-wbt" };
+  Object.keys(map).forEach(k => {
+    const b = document.getElementById(map[k]);
+    if (b) b.className = c[k] ? "active" : "";
+  });
+}
+
+function project3D(x, y, z, w, h, trimRad, heelRad) {
+  const c = window.lngc3D;
+  const ct = Math.cos(trimRad), st = Math.sin(trimRad);
+  const x1 = x * ct - y * st, y1 = x * st + y * ct;
+  const ch = Math.cos(heelRad), sh = Math.sin(heelRad);
+  const y2 = y1 * ch - z * sh, z2 = y1 * sh + z * ch;
+
+  const cy = Math.cos(c.yaw), sy = Math.sin(c.yaw);
+  const x3 = x1 * cy + z2 * sy, z3 = -x1 * sy + z2 * cy;
+  const cp = Math.cos(c.pitch), sp = Math.sin(c.pitch);
+  const y4 = y2 * cp - z3 * sp, z4 = y2 * sp + z3 * cp;
+
+  const fov = 560.0 / Math.max(220.0, 560.0 - z4 * 0.62);
+  const scale = (Math.min(w, h * 1.85) / 305.0) * c.zoom * fov;
+  return { sx: w * 0.5 + c.panX + x3 * scale, sy: h * 0.55 + c.panY - y4 * scale, depth: z4 };
+}
+
+function octSectionYZ(halfBeam, yBot, yTop) {
+  const h = yTop - yBot;
+  const wBot = halfBeam * 0.64, wTop = halfBeam * 0.56;
+  const yLow = yBot + h * 0.20, yHigh = yBot + h * 0.74;
+  return [
+    [yBot, -wBot], [yBot, wBot], [yLow, halfBeam], [yHigh, halfBeam],
+    [yTop, wTop], [yTop, -wTop], [yHigh, -halfBeam], [yLow, -halfBeam]
+  ];
+}
+
+// Ship half-breadth curve z(x, y) for 285m LNGC hull stations (-142m stern to +144m bow)
+function hullHalfBeam(x, y) {
+  const flare = Math.max(0.0, (y + 11.5) / 21.0);
+  if (x > 80.0) {
+    const u = Math.min(1.0, (x - 80.0) / 64.0);
+    const deckB = 23.2 * (1.0 - Math.pow(u, 1.65));
+    const keelB = 19.5 * Math.max(0.0, 1.0 - Math.pow(u * 1.08, 1.45));
+    return keelB + (deckB - keelB) * flare;
+  } else if (x < -92.0) {
+    const u = Math.min(1.0, (-92.0 - x) / 50.0);
+    const deckB = 23.2 * (1.0 - 0.52 * Math.pow(u, 1.8));
+    const keelB = 19.5 * (1.0 - 0.88 * Math.pow(u, 1.35));
+    return keelB + (deckB - keelB) * flare;
+  }
+  return 19.8 + (23.2 - 19.8) * Math.pow(flare, 0.75);
+}
+
+function bindCanvasTouch(canvas) {
+  const c = window.lngc3D;
+  canvas.addEventListener("touchstart", e => {
+    if (e.touches.length === 1) {
+      c.touchMode = "orbit"; c.lastX = e.touches[0].clientX; c.lastY = e.touches[0].clientY;
+    } else if (e.touches.length >= 2) {
+      c.touchMode = "pinch";
+      c.pinchDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY) || 1.0;
+      c.panLastX = (e.touches[0].clientX + e.touches[1].clientX) * 0.5;
+      c.panLastY = (e.touches[0].clientY + e.touches[1].clientY) * 0.5;
+    }
+  }, { passive: false });
+
+  canvas.addEventListener("touchmove", e => {
+    e.preventDefault();
+    if (c.touchMode === "orbit" && e.touches.length === 1) {
+      const dx = e.touches[0].clientX - c.lastX, dy = e.touches[0].clientY - c.lastY;
+      if (c.viewMode === "XSECT") { c.panX += dx; c.panY += dy; }
+      else { c.yaw += dx * 0.0075; c.pitch = Math.max(-0.25, Math.min(1.56, c.pitch + dy * 0.0075)); }
+      c.lastX = e.touches[0].clientX; c.lastY = e.touches[0].clientY;
+    } else if (e.touches.length >= 2) {
+      const dist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY) || 1.0;
+      c.zoom = Math.max(0.45, Math.min(4.00, c.zoom * (dist / c.pinchDist)));
+      c.pinchDist = dist;
+      const mx = (e.touches[0].clientX + e.touches[1].clientX) * 0.5, my = (e.touches[0].clientY + e.touches[1].clientY) * 0.5;
+      c.panX += (mx - c.panLastX); c.panY += (my - c.panLastY);
+      c.panLastX = mx; c.panLastY = my;
+      const sl = document.getElementById("zoom-slider-3d");
+      if (sl) sl.value = c.zoom.toFixed(2);
+    }
+    draw3DHullFrame(window.latestState || window.simEngine.state);
+  }, { passive: false });
+
+  canvas.addEventListener("touchend", e => {
+    if (e.touches.length === 1) { c.touchMode = "orbit"; c.lastX = e.touches[0].clientX; c.lastY = e.touches[0].clientY; }
+    else if (e.touches.length === 0) c.touchMode = "none";
+  });
+}
+
+function bindCanvasMouse(canvas) {
+  const c = window.lngc3D;
+  let down = false;
+  canvas.addEventListener("mousedown", e => { down = true; c.lastX = e.clientX; c.lastY = e.clientY; });
+  window.addEventListener("mouseup", () => { down = false; });
+  canvas.addEventListener("mousemove", e => {
+    if (!down) return;
+    const dx = e.clientX - c.lastX, dy = e.clientY - c.lastY;
+    if (e.shiftKey || c.viewMode === "XSECT") { c.panX += dx; c.panY += dy; }
+    else { c.yaw += dx * 0.007; c.pitch = Math.max(-0.25, Math.min(1.56, c.pitch + dy * 0.007)); }
+    c.lastX = e.clientX; c.lastY = e.clientY;
+    draw3DHullFrame(window.latestState || window.simEngine.state);
+  });
+  canvas.addEventListener("wheel", e => {
+    e.preventDefault(); adjustZoom(e.deltaY < 0 ? 0.14 : -0.14);
+  }, { passive: false });
+}
+
+function buildHullAndWater(st, addPoly, addLine) {
+  const ySea = -11.5 + (st.hydro.dm || 11.5);
+  const xs = [-140, -124, -106, -80, -45, 0, 45, 80, 106, 126, 142];
+
+  if (window.lngc3D.showHull) {
+    // 1. Multi-station Hull Plating: Submerged Anti-Fouling Boot-Top vs Topsides Freeboard
+    for (let i = 0; i < xs.length - 1; i++) {
+      const x0 = xs[i], x1 = xs[i + 1];
+      const bK0 = hullHalfBeam(x0, -11.5), bK1 = hullHalfBeam(x1, -11.5);
+      const bW0 = hullHalfBeam(x0, 0.0),   bW1 = hullHalfBeam(x1, 0.0);
+      const bD0 = hullHalfBeam(x0, 9.5),   bD1 = hullHalfBeam(x1, 9.5);
+      // Submerged lower hull (reddish-brown anti-fouling)
+      [-1, 1].forEach(s => {
+        addPoly([[x0,-11.5,s*bK0],[x1,-11.5,s*bK1],[x1,0.0,s*bW1],[x0,0.0,s*bW0]],
+                "rgba(135, 38, 42, 0.34)", "rgba(210, 75, 80, 0.45)", 1.0);
+        // Topsides hull plating (marine navy blue-grey)
+        addPoly([[x0,0.0,s*bW0],[x1,0.0,s*bW1],[x1,9.5,s*bD1],[x0,9.5,s*bD0]],
+                "rgba(20, 48, 82, 0.38)", "rgba(75, 135, 200, 0.60)", 1.2);
+      });
+      // Main weather deck framing
+      addPoly([[x0,9.5,-bD0],[x1,9.5,-bD1],[x1,9.5,bD1],[x0,9.5,bD0]],
+              "rgba(18, 38, 62, 0.42)", "rgba(65, 115, 170, 0.45)", 1.0);
+    }
+
+    // 2. Bulbous Bow & Raised Forecastle Deck + Transom Stern
+    addPoly([[134,-11.2,-3.8],[147,-8.2,0],[134,-5.0,-4.2]], "rgba(165,45,50,0.55)", "#e0555a", 1.3);
+    addPoly([[134,-11.2, 3.8],[147,-8.2,0],[134,-5.0, 4.2]], "rgba(165,45,50,0.55)", "#e0555a", 1.3);
+    addPoly([[106,9.5,-17.5],[142,13.0,0],[106,9.5,17.5]], "rgba(32,68,108,0.62)", "#589ce0", 1.5);
+    addPoly([[-140,0.0,-11.5],[-140,9.5,-11.5],[-140,9.5,11.5],[-140,0.0,11.5]], "rgba(22,48,80,0.55)", "#4a85c5", 1.3);
+
+    // 3. Aft Accommodation Superstructure, Bridge Wings & Twin Funnels (Port ME / Stbd GCU)
+    const addBox = (x0,x1,y0,y1,z0,z1,f,s,lw) => {
+      addPoly([[x0,y1,z0],[x1,y1,z0],[x1,y1,z1],[x0,y1,z1]], f, s, lw);
+      addPoly([[x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1]], f, s, lw);
+      addPoly([[x0,y0,z0],[x1,y0,z0],[x1,y1,z0],[x0,y1,z0]], f, s, lw);
+      addPoly([[x1,y0,z0],[x1,y1,z0],[x1,y1,z1],[x1,y0,z1]], f, s, lw);
+      addPoly([[x0,y0,z0],[x0,y1,z0],[x0,y1,z1],[x0,y0,z1]], f, s, lw);
+    };
+    addBox(-132, -108, 9.5, 23.5, -16.5, 16.5, "rgba(200,218,238,0.65)", "#8ab4e1", 1.3);
+    addBox(-118, -110, 23.5, 29.5, -21.5, 21.5, "rgba(225,240,255,0.82)", "#00d4ff", 1.5); // Navigation Bridge
+    addBox(-130, -121, 23.5, 33.5, -9.0, -3.2, "rgba(28,62,102,0.85)", "#4fa3e3", 1.3);  // Port ME Funnel
+    const gcuHot = st.gcu && st.gcu.burn_kgs > 0.05;
+    addBox(-130, -121, 23.5, 33.5,  3.2,  9.0, gcuHot ? "rgba(255,95,35,0.85)" : "rgba(28,62,102,0.85)",
+           gcuHot ? "#ffab00" : "#4fa3e3", 1.4); // Stbd GCU Funnel
+
+    // 4. Emphasized Ocean Water Surface Plane, Wave Ripples & Glowing Waterline Hull Contour
+    addPoly([[-160,ySea,-48],[160,ySea,-48],[160,ySea,48],[-160,ySea,48]],
+            "rgba(0, 140, 225, 0.22)", "rgba(0, 212, 255, 0.55)", 1.5);
+    for (let gx = -140; gx <= 140; gx += 28) addLine([gx, ySea, -46], [gx, ySea, 46], "rgba(0, 212, 255, 0.22)", 1.0);
+    for (let gz = -40; gz <= 40; gz += 16) addLine([-155, ySea, gz], [155, ySea, gz], "rgba(0, 212, 255, 0.22)", 1.0);
+    // Glowing Cyan Waterline Ring directly around the hull at ySea
+    for (let i = 0; i < xs.length - 1; i++) {
+      const b0 = hullHalfBeam(xs[i], ySea), b1 = hullHalfBeam(xs[i+1], ySea);
+      addLine([xs[i], ySea + 0.15, -b0], [xs[i+1], ySea + 0.15, -b1], "#00ffff", 2.6);
+      addLine([xs[i], ySea + 0.15,  b0], [xs[i+1], ySea + 0.15,  b1], "#00ffff", 2.6);
+    }
+  }
+}
+
+function buildTrunkAndTanks(st, addPoly, addLine, addOctPrism) {
+  const tX = [ [56, 101], [4, 51], [-49, -2], [-102, -55] ];
+  const tW = [ [18.8, 14.8], [19.2, 19.2], [19.2, 19.2], [18.6, 19.2] ];
+
+  // 1. Double-Hull U-Shaped WBT Floor & Wing Tanks
+  if (window.lngc3D.showWbt) {
+    tX.forEach((xr, i) => {
+      const wfP = (st.wbt_fill ? st.wbt_fill[i*2] : 15) / 100.0;
+      const wfS = (st.wbt_fill ? st.wbt_fill[i*2+1] : 15) / 100.0;
+      addPoly([[xr[0],-11.5,-21],[xr[1],-11.5,-21],[xr[1],-11.5+8.5*wfP,-21],[xr[0],-11.5+8.5*wfP,-21]],
+              "rgba(0,115,220,0.32)", "rgba(0,180,255,0.50)", 1.0);
+      addPoly([[xr[0],-11.5, 21],[xr[1],-11.5, 21],[xr[1],-11.5+8.5*wfS, 21],[xr[0],-11.5+8.5*wfS, 21]],
+              "rgba(0,115,220,0.32)", "rgba(0,180,255,0.50)", 1.0);
+    });
+  }
+
+  // 2. Continuous Raised Tank Trunk Deck & Cofferdam Bulkheads
+  if (window.lngc3D.showTrunk) {
+    addPoly([[-105,17.8,-11.2],[103,17.8,-11.2],[103,17.8,11.2],[-105,17.8,11.2]],
+            "rgba(32, 62, 96, 0.42)", "#589ce0", 1.8);
+    addPoly([[-105,9.5,-17.5],[103,9.5,-17.5],[103,17.8,-11.2],[-105,17.8,-11.2]],
+            "rgba(24, 48, 76, 0.30)", "#3f74a8", 1.2);
+    addPoly([[-105,9.5, 17.5],[103,9.5, 17.5],[103,17.8, 11.2],[-105,17.8, 11.2]],
+            "rgba(24, 48, 76, 0.30)", "#3f74a8", 1.2);
+    [-103, -52, 1, 53.5, 102].forEach(cx => {
+      addLine([cx, 9.5, -17.5], [cx, 17.8, -11.2], "#629cd4", 1.5);
+      addLine([cx, 9.5,  17.5], [cx, 17.8,  11.2], "#629cd4", 1.5);
+      addLine([cx, 17.8, -11.2], [cx, 17.8, 11.2], "#629cd4", 1.5);
+    });
+  }
+
+  // 3. 4x Octagonal Membrane Tanks, Liquid LNG Pools, Trunk Top Coamings & Liquid/Vapor Domes
+  st.tanks.forEach((t, i) => {
+    const x0 = tX[i][0], x1 = tX[i][1], w0 = tW[i][0], w1 = tW[i][1], xMid = (x0 + x1) * 0.5;
+    if (t.fill > 0.5) {
+      const yLiq = -9.2 + Math.min(0.985, t.fill / 100.0) * 26.2;
+      addOctPrism(x0+0.4, x1-0.4, w0*0.97, w1*0.97, -9.2, yLiq,
+                  t.slosh ? "rgba(255,171,0,0.62)" : "rgba(0,195,255,0.60)",
+                  t.slosh ? "#ffab00" : "#00e5ff", 1.4);
+    }
+    addOctPrism(x0, x1, w0, w1, -9.2, 17.2,
+                t.is_ch4 > 5.0 ? "rgba(255,61,87,0.24)" : "rgba(0,212,255,0.08)",
+                t.is_ch4 > 5.0 ? "#ff3d57" : "rgba(0,212,255,0.72)", 1.5);
+    // Tank Trunk Top Coaming, Liquid Dome (Aft) & Vapor Dome (Fwd) + Internal Pump Tower
+    const xLiqDome = x0 + 7.5, xVapDome = xMid + 4.0;
+    addPoly([[x0+3,18.0,-6.5],[x1-3,18.0,-6.5],[x1-3,18.0,6.5],[x0+3,18.0,6.5]],
+            "rgba(42,82,122,0.58)", "#7bc0ff", 1.4); // Tank Trunk Top
+    addPoly([[xLiqDome-2.5,19.6,-2.5],[xLiqDome+2.5,19.6,-2.5],[xLiqDome+2.5,19.6,2.5],[xLiqDome-2.5,19.6,2.5]],
+            "rgba(0,229,255,0.85)", "#ffffff", 1.5); // Liquid Dome
+    addPoly([[xVapDome-2.0,19.4,-2.0],[xVapDome+2.0,19.4,-2.0],[xVapDome+2.0,19.4,2.0],[xVapDome-2.0,19.4,2.0]],
+            "rgba(255,171,0,0.85)", "#ffffff", 1.4); // Vapor Dome
+    addLine([xLiqDome, -9.0, 0], [xLiqDome, 19.6, 0], "#e2f1ff", 2.8); // Pump Tower Shaft
+  });
+}
+
+function buildDeckPipingAndMachinery(st, addPoly, addLine) {
+  if (!window.lngc3D.showPipes) return;
+  const tX = [ [56, 101], [4, 51], [-49, -2], [-102, -55] ];
+  const phase = window.lngc3D.animPhase;
+
+  // 1. Cargo Compressor Room & Electric Motor Room Deckhouse (On Trunk Deck x = -56 to -44)
+  const compRun = st.comp && st.comp.some(c => c.run);
+  const compCol = compRun ? "rgba(0, 230, 118, 0.55)" : "rgba(45, 75, 110, 0.72)";
+  const compBdr = compRun ? "#00e676" : "#7bc0ff";
+  // Compressor Room (Stbd/Center z = -3 to +9.5) & Motor Room (Port z = -9.5 to -3)
+  addPoly([[-56,22.8,-3.0],[-44,22.8,-3.0],[-44,22.8,9.5],[-56,22.8,9.5]], compCol, compBdr, 1.8);
+  addPoly([[-56,17.8, 9.5],[-44,17.8, 9.5],[-44,22.8,9.5],[-56,22.8,9.5]], compCol, compBdr, 1.5);
+  addPoly([[-56,22.2,-9.5],[-44,22.2,-9.5],[-44,22.2,-3.0],[-56,22.2,-3.0]], "rgba(65,105,155,0.72)", "#9ec2e6", 1.5);
+  addPoly([[-56,17.8,-9.5],[-44,17.8,-9.5],[-44,22.2,-9.5],[-56,22.2,-9.5]], "rgba(65,105,155,0.72)", "#9ec2e6", 1.4);
+
+  // 2. Midship Port & Starboard Cryogenic Manifolds (x = -5 to +5, z = -23.5 to +23.5)
+  const mMode = st.manifold ? st.manifold.mode : 0;
+  const esdOk = !st.esd1;
+  const maniCol = !esdOk ? "rgba(255,61,87,0.80)" : (mMode > 0 ? "rgba(0,230,118,0.80)" : "rgba(0,212,255,0.65)");
+  // Port & Starboard Manifold Drip Trays & Quick-Connect Flanges
+  addPoly([[-5.5,11.5,-23.6],[5.5,11.5,-23.6],[5.5,11.5,-17.5],[-5.5,11.5,-17.5]], maniCol, "#ffffff", 1.6);
+  addPoly([[-5.5,11.5, 17.5],[5.5,11.5, 17.5],[5.5,11.5, 23.6],[-5.5,11.5, 23.6]], maniCol, "#ffffff", 1.6);
+  // 4 Liquid Crossover Pipes + 1 Vapor Return Crossover Pipe across Midship Trunk Deck
+  [-4.0, -2.0, 0.0, 2.0].forEach(mx => {
+    addLine([mx, 18.6, -23.4], [mx, 18.6, 23.4], "#00e5ff", 2.4);
+    addLine([mx, 18.6, -23.4], [mx, 11.5, -23.4], "#00e5ff", 2.2);
+    addLine([mx, 18.6,  23.4], [mx, 11.5,  23.4], "#00e5ff", 2.2);
+  });
+  addLine([4.2, 19.0, -23.4], [4.2, 19.0, 23.4], "#ff4081", 2.4); // Vapor Return Crossover
+  addLine([4.2, 19.0, -23.4], [4.2, 11.5, -23.4], "#ff4081", 2.2);
+  addLine([4.2, 19.0,  23.4], [4.2, 11.5,  23.4], "#ff4081", 2.2);
+
+  // 3. 4x Vent Mast Risers (MAST #1 - #4) with A-Frame Supports & Relief Plumes
+  st.tanks.forEach((t, i) => {
+    const xMast = tX[i][1] - 4.5;
+    const marv = t.p_dome >= 25.0;
+    addLine([xMast, 17.8, 0.0], [xMast, 30.8, 0.0], marv ? "#ff3d57" : "#dce8f8", 3.0);
+    addLine([xMast - 2.5, 17.8, -3.2], [xMast, 27.5, 0.0], "#8ab4e1", 1.4);
+    addLine([xMast - 2.5, 17.8,  3.2], [xMast, 27.5, 0.0], "#8ab4e1", 1.4);
+    // Vent hood crown
+    addLine([xMast - 1.2, 30.8, 0.0], [xMast + 1.2, 30.8, 0.0], marv ? "#ff3d57" : "#ffab00", 3.5);
+  });
+
+  // 4. All 6 Longitudinal Cryogenic Deck Piping Headers along Trunk Top
+  const liqFlow = Math.abs(st.manifold ? st.manifold.shore_liq_kgs : 0) > 1.0 ||
+                  st.tanks.some(t => t.p1_amps > 10 || t.p2_amps > 10);
+  const vapFlow = compRun;
+  // (A) Main Liquid Header (Cyan #00e5ff, z = +5.2m)
+  addLine([-96, 18.8, 5.2], [96, 18.8, 5.2], "#00e5ff", 3.2, liqFlow ? [8, 5] : null, phase);
+  // (B) Common Vapor / BOG Header (Amber #ffab00, z = -4.8m)
+  addLine([-96, 19.2, -4.8], [96, 19.2, -4.8], "#ffab00", 2.8, vapFlow ? [7, 5] : null, -phase);
+  // (C) Stripping / Spray Header (Light Blue #40c4ff, z = +3.0m)
+  addLine([-96, 18.5, 3.0], [96, 18.5, 3.0], "#40c4ff", 1.8, [4, 4]);
+  // (D) Shore Vapor Return Line from Comp Room to Midship Manifold (Magenta #ff4081, z = -2.2m)
+  addLine([-46, 19.5, -2.2], [4.2, 19.5, -2.2], "#ff4081", 2.4, (st.manifold && st.manifold.shore_vap_kgs > 0.1) ? [6, 4] : null, phase);
+  // (E) Fuel Gas Supply Line from Comp Room Aft to Engine Room & GCU (Green #00e676, z = +1.2m)
+  addLine([-125, 19.5, 1.2], [-50, 19.5, 1.2], "#00e676", 2.4, [6, 4], -phase);
+  // (F) Nitrogen (N2) Insulation Space Bleed Header (Purple #b388ff, z = -8.5m)
+  addLine([-98, 18.3, -8.5], [98, 18.3, -8.5], "#b388ff", 1.6);
+
+  // Branch Connections from Each Tank Dome to the Longitudinal Headers & Mast Risers
+  st.tanks.forEach((t, i) => {
+    const xLiqDome = tX[i][0] + 7.5, xVapDome = (tX[i][0] + tX[i][1]) * 0.5 + 4.0, xMast = tX[i][1] - 4.5;
+    addLine([xLiqDome, 19.0, 0.0], [xLiqDome, 18.8, 5.2], "#00e5ff", 2.2);   // Liquid branch
+    addLine([xLiqDome, 18.6, 0.0], [xLiqDome, 18.5, 3.0], "#40c4ff", 1.6);   // Spray branch
+    addLine([xVapDome, 19.2, 0.0], [xVapDome, 19.2, -4.8], "#ffab00", 2.2);  // Vapor branch
+    addLine([xMast, 21.0, 0.0], [xMast, 19.2, -4.8], "#ffab00", 1.8);        // Mast riser feed
+  });
+}
+
+function draw3DOverview(ctx, w, h, st) {
+  window.lngc3D.animPhase = (window.lngc3D.animPhase + 1.5) % 40.0;
+  const trimRad = Math.atan2(st.hydro.trim || 0, 285.0);
+  const heelRad = ((st.hydro.heel || 0) * Math.PI) / 180.0;
+  const proj = (x, y, z) => project3D(x, y, z, w, h, trimRad, heelRad);
+  const queue = [];
+
+  const addPoly = (pts3d, fill, stroke, lineW) => {
+    const p2 = pts3d.map(p => proj(p[0], p[1], p[2]));
+    const zAvg = p2.reduce((a, b) => a + b.depth, 0) / p2.length;
+    queue.push({ type: "poly", pts: p2, fill, stroke, lineW: lineW || 1.0, depth: zAvg });
+  };
+  const addLine = (pA, pB, stroke, lineW, dash, dashOff) => {
+    const a = proj(pA[0], pA[1], pA[2]), b = proj(pB[0], pB[1], pB[2]);
+    queue.push({ type: "line", a, b, stroke, lineW: lineW || 1.2, dash, dashOff: dashOff || 0, depth: (a.depth + b.depth) * 0.5 });
+  };
+  const addOctPrism = (x0, x1, w0, w1, yBot, yTop, fill, stroke, lineW) => {
+    const s0 = octSectionYZ(w0, yBot, yTop), s1 = octSectionYZ(w1, yBot, yTop);
+    for (let i = 0; i < 8; i++) {
+      const ni = (i + 1) % 8;
+      addPoly([[x0,s0[i][0],s0[i][1]],[x1,s1[i][0],s1[i][1]],[x1,s1[ni][0],s1[ni][1]],[x0,s0[ni][0],s0[ni][1]]], fill, stroke, lineW);
+    }
+    addPoly(s0.map(yz => [x0, yz[0], yz[1]]), fill, stroke, lineW);
+    addPoly(s1.map(yz => [x1, yz[0], yz[1]]), fill, stroke, lineW);
+  };
+
+  buildHullAndWater(st, addPoly, addLine);
+  buildTrunkAndTanks(st, addPoly, addLine, addOctPrism);
+  buildDeckPipingAndMachinery(st, addPoly, addLine);
+
+  queue.sort((a, b) => a.depth - b.depth);
+  queue.forEach(item => {
+    ctx.beginPath();
+    ctx.setLineDash(item.dash || []);
+    ctx.lineDashOffset = item.dashOff || 0;
+    if (item.type === "poly") {
+      item.pts.forEach((p, idx) => idx === 0 ? ctx.moveTo(p.sx, p.sy) : ctx.lineTo(p.sx, p.sy));
+      ctx.closePath();
+      if (item.fill) { ctx.fillStyle = item.fill; ctx.fill(); }
+      if (item.stroke) { ctx.strokeStyle = item.stroke; ctx.lineWidth = item.lineW; ctx.stroke(); }
+    } else {
+      ctx.moveTo(item.a.sx, item.a.sy); ctx.lineTo(item.b.sx, item.b.sy);
+      ctx.strokeStyle = item.stroke; ctx.lineWidth = item.lineW; ctx.stroke();
+    }
+  });
+  ctx.setLineDash([]); ctx.lineDashOffset = 0;
+
+  // Callout Badges for CT1-CT4, Masts, Compressor Room, Manifold & Drafts
+  const tX = [ [56, 101], [4, 51], [-49, -2], [-102, -55] ];
+  st.tanks.forEach((t, i) => {
+    const xMid = (tX[i][0] + tX[i][1]) * 0.5, p = proj(xMid, 24.5, 0);
+    ctx.fillStyle = "rgba(6, 13, 24, 0.88)";
+    ctx.strokeStyle = t.slosh ? "#ffab00" : (t.is_ch4 > 5 ? "#ff3d57" : "#00d4ff");
+    ctx.lineWidth = 1.2; ctx.fillRect(p.sx - 54, p.sy - 14, 108, 28); ctx.strokeRect(p.sx - 54, p.sy - 14, 108, 28);
+    ctx.fillStyle = "#fff"; ctx.font = "bold 10px monospace";
+    ctx.fillText(`CT${t.id}:${t.fill.toFixed(1)}% M#${t.id}`, p.sx - 49, p.sy - 2);
+    ctx.fillStyle = "#8ab4e1"; ctx.fillText(`${t.p_dome.toFixed(1)}kPa ${t.t_liq.toFixed(0)}\u00b0C`, p.sx - 49, p.sy + 10);
+  });
+
+  const pComp = proj(-50, 25.5, 3), pMani = proj(0, 14.5, 24.5), pGcu = proj(-126, 36.0, 6);
+  ctx.font = "bold 10px monospace";
+  ctx.fillStyle = "#00e676"; ctx.fillText("COMP/MOTOR RM", pComp.sx - 38, pComp.sy);
+  ctx.fillStyle = "#00e5ff"; ctx.fillText("MANIFOLD P/S", pMani.sx - 36, pMani.sy);
+  ctx.fillStyle = "#ffab00"; ctx.fillText("GCU/ME FUNNELS", pGcu.sx - 42, pGcu.sy);
+  const pBow = proj(145, 2.0, 0), pStern = proj(-142, 2.0, 0);
+  ctx.fillStyle = "#00ffff";
+  ctx.fillText(`Tf ${st.hydro.df.toFixed(2)}m`, pBow.sx - 24, pBow.sy);
+  ctx.fillText(`Ta ${st.hydro.da.toFixed(2)}m`, pStern.sx - 28, pStern.sy);
+}
+
+function drawMidshipXSection(ctx, w, h, st) {
+  const t = st.tanks[1], cx = w * 0.5 + window.lngc3D.panX * 0.5, cy = h * 0.56 + window.lngc3D.panY * 0.5;
+  const sc = Math.min(w, h) * 0.0092 * window.lngc3D.zoom;
+  const pt = (z, y) => [cx + z * sc, cy - y * sc];
+  const poly = (yz, f, s, lw, d) => {
+    ctx.beginPath(); ctx.setLineDash(d || []);
+    yz.forEach((p, i) => { const q = pt(p[1], p[0]); i === 0 ? ctx.moveTo(q[0], q[1]) : ctx.lineTo(q[0], q[1]); });
+    ctx.closePath(); if (f) { ctx.fillStyle = f; ctx.fill(); }
+    if (s) { ctx.strokeStyle = s; ctx.lineWidth = lw || 1.5; ctx.stroke(); }
+    ctx.setLineDash([]);
+  };
+  // Waterline & Outer Hull + Raised Trunk Top + Dome + Mast Riser + Deck Piping
+  const ySea = -11.5 + (st.hydro.dm || 11.5), wlL = pt(-34, ySea), wlR = pt(34, ySea);
+  ctx.fillStyle = "rgba(0,140,225,0.22)"; ctx.fillRect(wlL[0], wlL[1], wlR[0] - wlL[0], pt(34, -14)[1] - wlL[1]);
+  ctx.strokeStyle = "#00ffff"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(wlL[0], wlL[1]); ctx.lineTo(wlR[0], wlR[1]); ctx.stroke();
+  poly([[-11.5,-22.5],[-11.5,22.5],[9.5,23.2],[18.0,11.5],[18.0,-11.5],[9.5,-23.2]], "rgba(16,34,58,0.88)", "#589ce0", 2.2);
+  poly(octSectionYZ(20.0, -9.8, 17.5), "rgba(10,20,35,0.95)", t.is_ch4 > 5 ? "#ff3d57" : "#ffab00", 1.8, [5, 3]);
+  const mem = octSectionYZ(19.2, -9.2, 17.0);
+  poly(mem, "#060c16", "#00d4ff", 2.5);
+  if (t.fill > 0.5) {
+    const yLiq = -9.2 + Math.min(0.985, t.fill / 100.0) * 26.2;
+    ctx.save(); ctx.beginPath(); mem.forEach((p, i) => { const q = pt(p[1], p[0]); i===0?ctx.moveTo(q[0],q[1]):ctx.lineTo(q[0],q[1]); }); ctx.clip();
+    const tl = pt(-20, yLiq), br = pt(20, -9.5);
+    ctx.fillStyle = t.slosh ? "rgba(255,171,0,0.62)" : "rgba(0,185,255,0.62)";
+    ctx.fillRect(tl[0], tl[1], br[0] - tl[0], br[1] - tl[1]); ctx.restore(); poly(mem, null, "#00d4ff", 2.5);
+  }
+  poly([[17.0,-3.5],[17.0,3.5],[20.0,3.5],[20.0,-3.5]], "rgba(0,212,255,0.45)", "#fff", 1.5); // Tank Dome
+  const pTop = pt(0, 20.0), pBot = pt(0, -8.8), pMast = pt(0, 29.0);
+  ctx.strokeStyle = "#e2f1ff"; ctx.lineWidth = 3.5; ctx.beginPath(); ctx.moveTo(pTop[0], pTop[1]); ctx.lineTo(pBot[0], pBot[1]); ctx.stroke();
+  ctx.strokeStyle = "#ffab00"; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(pTop[0], pTop[1]); ctx.lineTo(pMast[0], pMast[1]); ctx.stroke();
+}
+
+function render3DHullView(st) {
+  const c = window.lngc3D;
+  return `<div class="card">
+    <div class="ctrl-row" style="margin-bottom:6px;flex-wrap:wrap;gap:5px;">
+      <h3 style="border:none;margin:0;">GTT MARK III FLEX 3D HULL, TRUNK TOP, PIPING &amp; MANIFOLD</h3>
+      <div style="display:flex;flex-wrap:wrap;gap:4px;">
+        <button id="btn-cam-ISO" class="${c.viewMode==='ISO'?'active':''}" onclick="setCamPreset('ISO')">3D ISO</button>
+        <button id="btn-cam-PROFILE" class="${c.viewMode==='PROFILE'?'active':''}" onclick="setCamPreset('PROFILE')">PROFILE</button>
+        <button id="btn-cam-PLAN" class="${c.viewMode==='PLAN'?'active':''}" onclick="setCamPreset('PLAN')">DECK PLAN</button>
+        <button id="btn-cam-XSECT" class="${c.viewMode==='XSECT'?'active':''}" onclick="setCamPreset('XSECT')">MIDSHIP X-SECT</button>
+        <button id="btn-lay-hull" class="${c.showHull?'active':''}" onclick="toggle3DLayer('showHull')">HULL &amp; SEA</button>
+        <button id="btn-lay-trunk" class="${c.showTrunk?'active':''}" onclick="toggle3DLayer('showTrunk')">TRUNK TOP</button>
+        <button id="btn-lay-pipes" class="${c.showPipes?'active':''}" onclick="toggle3DLayer('showPipes')">PIPING/COMP/MASTS</button>
+        <button id="btn-lay-wbt" class="${c.showWbt?'active':''}" onclick="toggle3DLayer('showWbt')">WBT</button>
+      </div>
+    </div>
+    <canvas id="webgl-hull" style="width:100%;height:400px;background:#040912;border:1px solid #1e2f4d;border-radius:4px;touch-action:none;display:block;"></canvas>
+    <div class="ctrl-row" style="margin-top:6px;flex-wrap:wrap;font-size:11px;">
+      <span style="color:#00e5ff;">&#9644; Liquid Hdr</span>
+      <span style="color:#ffab00;">&#9644; Vapor/BOG Hdr &amp; Masts</span>
+      <span style="color:#ff4081;">&#9644; HD Shore Return</span>
+      <span style="color:#00e676;">&#9644; Fuel Gas / Comp Rm</span>
+      <span style="color:#40c4ff;">&#9644; Spray Line</span>
+      <span style="color:#b388ff;">&#9644; N2 Barrier</span>
+    </div>
+    <div class="ctrl-row" style="margin-top:6px;flex-wrap:wrap;">
+      <button onclick="adjustZoom(-0.20)">ZOOM &minus;</button>
+      <input id="zoom-slider-3d" type="range" min="0.45" max="4.00" step="0.05" value="${c.zoom.toFixed(2)}" oninput="window.lngc3D.zoom=parseFloat(this.value);draw3DHullFrame(window.latestState||window.simEngine.state)">
+      <button onclick="adjustZoom(0.20)">ZOOM +</button>
+      <button onclick="setCamPreset('ISO')">RESET VIEW</button>
+    </div>
+  </div>`;
+}
+
+function draw3DHullFrame(st) {
+  const canvas = document.getElementById("webgl-hull");
+  if (!canvas) return;
+  const c = window.lngc3D;
+  if (c.canvas !== canvas) {
+    c.canvas = canvas; c.ctx = canvas.getContext("2d");
+    bindCanvasTouch(canvas); bindCanvasMouse(canvas);
+  }
+  const dpr = window.devicePixelRatio || 1, rect = canvas.getBoundingClientRect();
+  const w = Math.max(300, rect.width), h = Math.max(240, rect.height);
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+  }
+  const ctx = c.ctx;
+  ctx.save(); ctx.scale(dpr, dpr);
+  ctx.fillStyle = "#040912"; ctx.fillRect(0, 0, w, h);
+  if (c.viewMode === "XSECT") drawMidshipXSection(ctx, w, h, st);
+  else draw3DOverview(ctx, w, h, st);
+  ctx.restore();
+}
+
+</script>
+  <script>
+// LNGC Membrane UI & Decluttered SVG Mimics (Views 1-12, 7-Bit ASCII)
+const VIEWS = [
+  "0:3D HULL", "1:CT1", "2:CT2", "3:CT3", "4:CT4", "5:BOG/GCU", "6:MANIFOLD",
+  "7:WBT", "8:FGD/ESD", "9:LOAD", "10:BARRIER", "11:PRESETS", "12:OPS DATA"
+];
+let activeView = 0;
+
+function initNav() {
+  const nav = document.getElementById("navbar");
+  nav.innerHTML = VIEWS.map((v, i) =>
+    `<button id="nav-${i}" class="${i === activeView ? 'active' : ''}" onclick="setView(${i})">${v}</button>`
+  ).join("");
+}
+
+function setView(idx) {
+  activeView = idx;
+  VIEWS.forEach((_, i) => {
+    const b = document.getElementById("nav-" + i);
+    if (b) b.className = (i === activeView) ? "active" : "";
+  });
+  renderCurrentView(window.latestState || window.simEngine.state);
+}
+
+function updateTopBar(st) {
+  document.getElementById("tb-time").textContent = st.sim_time.toFixed(1);
+  const pAvg = st.tanks.reduce((a, t) => a + t.p_dome, 0) * 0.25;
+  document.getElementById("tb-pdome").textContent = pAvg.toFixed(2);
+  document.getElementById("tb-mefuel").textContent = st.me_fuel_kgs.toFixed(2);
+  const esdEl = document.getElementById("tb-esd");
+  esdEl.textContent = st.esd1 ? ("ESD-1: " + st.esd_reason) : "ESD-1: NORMAL";
+  esdEl.className = "badge " + (st.esd1 ? "esd-trip" : "esd-ok");
+  const bTag = document.getElementById("backend-tag");
+  bTag.textContent = window.useBackend ? "C++20 SERVER" : "JS STANDALONE";
+  bTag.style.color = window.useBackend ? "#00e676" : "#00d4ff";
+}
+
+function renderTankView(st, idx) {
+  const t = st.tanks[idx];
+  const fillH = Math.max(0, Math.min(100, t.fill)) * 1.9;
+  const liqY = 230 - fillH;
+  const p1Col = t.p1_amps > 10 ? "#00e676" : "#4a607a";
+  const p2Col = t.p2_amps > 10 ? "#00e676" : "#4a607a";
+  const spCol = t.sp_amps > 5 ? "#00d4ff" : "#4a607a";
+  const marvCol = t.p_dome >= 25.0 ? "#ff3d57" : "#4a607a";
+  const isCol = t.is_ch4 > 5.0 ? "#ff3d57" : "#1e3a5f";
+  const sprayOp = (t.spray_v || 0) > 1 ? 0.75 : 0.0;
+
+  return `<div class="grid-2">
+    <div class="card">
+      <h3>CT${t.id} GTT MARK III FLEX MEMBRANE MIMIC (NO CENTER BHD)</h3>
+      <svg viewBox="0 0 420 260">
+        <defs>
+          <clipPath id="octClip">
+            <polygon points="105,40 315,40 360,80 360,200 320,230 100,230 60,200 60,80"/>
+          </clipPath>
+        </defs>
+        <!-- Secondary & Primary Insulation Space Outline (IBS / IS) -->
+        <polygon points="97,32 323,32 370,76 370,205 326,238 94,238 50,205 50,76"
+                 fill="none" stroke="${isCol}" stroke-width="4" stroke-dasharray="6,3"/>
+        <!-- Liquid LNG Pool Clipped to Octagonal Membrane -->
+        <g clip-path="url(#octClip)">
+          <rect x="50" y="${liqY}" width="320" height="${fillH + 10}" fill="#0088cc" fill-opacity="0.55"/>
+          <line x1="50" y1="${liqY}" x2="370" y2="${liqY}" stroke="#00d4ff" stroke-width="2"/>
+          <!-- Sloshing Barred Zone Band (10% to 70%) -->
+          <line x1="60" y1="97" x2="360" y2="97" stroke="#ffab00" stroke-width="1" stroke-dasharray="4,4"/>
+          <line x1="60" y1="211" x2="360" y2="211" stroke="#ffab00" stroke-width="1" stroke-dasharray="4,4"/>
+        </g>
+        <!-- Primary Corrugated Membrane Wall -->
+        <polygon points="105,40 315,40 360,80 360,200 320,230 100,230 60,200 60,80"
+                 fill="none" stroke="#00d4ff" stroke-width="2.5"/>
+        <!-- Top Spray Cooling Rings -->
+        <g stroke="#00d4ff" stroke-width="1.5" opacity="${sprayOp}">
+          <line x1="130" y1="45" x2="115" y2="85" stroke-dasharray="3,3"/>
+          <line x1="150" y1="45" x2="165" y2="85" stroke-dasharray="3,3"/>
+          <line x1="270" y1="45" x2="255" y2="85" stroke-dasharray="3,3"/>
+          <line x1="290" y1="45" x2="305" y2="85" stroke-dasharray="3,3"/>
+        </g>
+        <!-- Central Stainless Steel Pump Tower -->
+        <line x1="204" y1="28" x2="204" y2="225" stroke="#8aa4c4" stroke-width="2.5"/>
+        <line x1="216" y1="28" x2="216" y2="225" stroke="#8aa4c4" stroke-width="2.5"/>
+        <!-- Submerged Cargo Pumps P1, P2 & Spray Pump SP -->
+        <circle cx="184" cy="218" r="9" fill="${p1Col}" stroke="#fff" stroke-width="1.2"/>
+        <circle cx="236" cy="218" r="9" fill="${p2Col}" stroke="#fff" stroke-width="1.2"/>
+        <circle cx="210" cy="222" r="6" fill="${spCol}" stroke="#fff" stroke-width="1"/>
+        <!-- Dome & MARVS Riser -->
+        <rect x="195" y="16" width="30" height="14" fill="#132238" stroke="#00d4ff" stroke-width="1.5"/>
+        <circle cx="265" cy="22" r="7" fill="${marvCol}" stroke="#fff" stroke-width="1"/>
+      </svg>
+    </div>
+    <div class="card">
+      <h3>CT${t.id} TELEMETRY &amp; CONTROLS</h3>
+      <div class="kv"><span>Fill Level / Volume:</span><span>${t.fill.toFixed(2)} % (${t.vol.toFixed(0)} m&sup3;)</span></div>
+      <div class="kv"><span>Cargo Mass:</span><span>${t.mass.toFixed(1)} MT</span></div>
+      <div class="kv"><span>Dome Pressure (MARVS 25 kPaG):</span><span>${t.p_dome.toFixed(2)} kPaG</span></div>
+      <div class="kv"><span>Liquid / Vapor Temp:</span><span>${t.t_liq.toFixed(1)} &deg;C / ${t.t_vap.toFixed(1)} &deg;C</span></div>
+      <div class="kv"><span>Membrane Temp / Cool Rate:</span><span>${t.t_mem.toFixed(1)} &deg;C (${t.cool_rate.toFixed(1)} &deg;C/h)</span></div>
+      <div class="kv"><span>Boil-Off Rate (BOR):</span><span>${t.bor_kgs.toFixed(3)} kg/s</span></div>
+      <div class="kv"><span>Primary / Secondary N2 (IS/IBS):</span><span>${t.p_is.toFixed(2)} / ${t.p_ibs.toFixed(2)} kPaG (CH4: ${t.is_ch4.toFixed(1)}%)</span></div>
+      <div class="kv"><span>Sloshing Status (10-70% Zone):</span><span class="${t.slosh ? 'warn-text' : 'ok-text'}">${t.slosh ? 'SLOSHING RESONANCE ZONE' : 'SAFE'}</span></div>
+      <div class="ctrl-row">
+        <span>Liquid Fill Valve (${(t.fill_v || 0).toFixed(0)}%):</span>
+        <input type="range" min="0" max="100" value="${t.fill_v || 0}" oninput="sendCmd('tank=${idx}&fill_v='+this.value)">
+      </div>
+      <div class="ctrl-row">
+        <span>Top Spray Valve (${(t.spray_v || 0).toFixed(0)}%):</span>
+        <input type="range" min="0" max="100" value="${t.spray_v || 0}" oninput="sendCmd('tank=${idx}&spray_v='+this.value)">
+      </div>
+      <div class="ctrl-row" style="margin-top:10px;">
+        <button onclick="sendCmd('tank=${idx}&pump_tog=0')">MAIN P1 (${t.p1_amps.toFixed(0)}A)</button>
+        <button onclick="sendCmd('tank=${idx}&pump_tog=1')">MAIN P2 (${t.p2_amps.toFixed(0)}A)</button>
+        <button onclick="sendCmd('tank=${idx}&pump_tog=2')">SPRAY PUMP (${t.sp_amps.toFixed(0)}A)</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderBogGcuView(st) {
+  const c0 = st.comp[0], c2 = st.comp[2];
+  const ldX = 50 + Math.min(280, (c0.qa / 5500.0) * 280);
+  const ldY = 190 - Math.min(150, (c0.hp / 450.0) * 150);
+  const hdX = 50 + Math.min(280, (c2.qa / 20000.0) * 280);
+  const hdY = 190 - Math.min(150, (c2.hp / 180.0) * 150);
+
+  const compCards = st.comp.map((c, i) => {
+    const label = i < 2 ? `LD COMP #${i + 1} (FUEL GAS)` : `HD COMP #${i - 1} (SHORE RETURN)`;
+    return `<div class="card">
+      <h3>${label}</h3>
+      <div class="kv"><span>Status / Mode:</span><span class="${c.run ? 'ok-text' : ''}">${c.run ? 'RUNNING' : 'STOPPED'}</span></div>
+      <div class="kv"><span>Polytropic Head (Hp):</span><span>${c.hp.toFixed(1)} kJ/kg</span></div>
+      <div class="kv"><span>Suction Flow / Surge Line:</span><span>${c.qa.toFixed(0)} / ${c.q_surge.toFixed(0)} m&sup3;/h</span></div>
+      <div class="kv"><span>IGV Opening / ASV Recycle:</span><span>${c.igv.toFixed(1)}% / ${c.asv.toFixed(1)}%</span></div>
+      <div class="kv"><span>Net Mass Flow / Power:</span><span>${c.kgs.toFixed(2)} kg/s (${c.kw.toFixed(0)} kW)</span></div>
+      <div class="kv"><span>Discharge Temp:</span><span>${c.t_dis.toFixed(1)} &deg;C</span></div>
+      <div class="ctrl-row">
+        <button onclick="sendCmd('comp_tog=${i}')">${c.run ? 'STOP' : 'START'}</button>
+        <input type="range" min="15" max="100" value="${c.igv}" oninput="sendCmd('comp=${i}&igv='+this.value)">
+      </div>
+    </div>`;
+  }).join("");
+
+  return `<div class="grid-2" style="margin-bottom:10px;">
+    <div class="card">
+      <h3>CENTRIFUGAL COMPRESSOR 2D MAP (Hp vs Qa &amp; SURGE LINE)</h3>
+      <svg viewBox="0 0 380 220">
+        <line x1="50" y1="25" x2="50" y2="190" stroke="#4a607a" stroke-width="1.5"/>
+        <line x1="50" y1="190" x2="350" y2="190" stroke="#4a607a" stroke-width="1.5"/>
+        <!-- Surge Limit Line -->
+        <line x1="95" y1="185" x2="175" y2="35" stroke="#ff3d57" stroke-width="2" stroke-dasharray="5,4"/>
+        <text x="180" y="45" fill="#ff3d57" font-size="10">SURGE LIMIT LINE</text>
+        <!-- Characteristic IGV Curves -->
+        <path d="M 110 55 Q 230 65 320 185" fill="none" stroke="#1e3a5f" stroke-width="2"/>
+        <path d="M 98 95 Q 195 105 265 185" fill="none" stroke="#1e3a5f" stroke-width="1.5"/>
+        <!-- Live Operating Points -->
+        <circle cx="${ldX}" cy="${ldY}" r="6" fill="#00e676" stroke="#fff"/>
+        <text x="${ldX + 8}" y="${ldY + 3}" fill="#00e676" font-size="10">LD1</text>
+        <circle cx="${hdX}" cy="${hdY}" r="6" fill="#00d4ff" stroke="#fff"/>
+        <text x="${hdX + 8}" y="${hdY + 3}" fill="#00d4ff" font-size="10">HD1</text>
+        <text x="155" y="210" fill="#7b93b2" font-size="10">Volumetric Flow Qa (m3/h)</text>
+      </svg>
+    </div>
+    <div class="card">
+      <h3>GCU, MAIN ENGINE FUEL &amp; STEAM VAPORIZERS</h3>
+      <div class="kv"><span>GCU Feed Valve / Burn Flow:</span><span>${st.gcu.valve.toFixed(1)}% (${st.gcu.burn_kgs.toFixed(2)} kg/s)</span></div>
+      <div class="kv"><span>GCU Thermal Load / Flue Temp:</span><span>${st.gcu.mw.toFixed(1)} MW / ${st.gcu.temp_c.toFixed(0)} &deg;C</span></div>
+      <div class="kv"><span>Main Vaporizer (Vacuum Makeup):</span><span>${st.vap.main_en ? 'ONLINE' : 'OFF'} (${st.vap.main_kgs.toFixed(2)} kg/s)</span></div>
+      <div class="kv"><span>Forcing Vaporizer (Fuel Boost):</span><span>${st.vap.force_en ? 'ONLINE' : 'OFF'} (${st.vap.force_kgs.toFixed(2)} kg/s)</span></div>
+      <div class="ctrl-row">
+        <span>ME Fuel Demand (${st.me_fuel_kgs.toFixed(2)} kg/s):</span>
+        <input type="range" min="0" max="2.2" step="0.05" value="${st.me_fuel_kgs}" oninput="sendCmd('me_fuel='+this.value)">
+      </div>
+      <div class="ctrl-row">
+        <span>HD Desuperheater Spray (${st.vap.desup_v.toFixed(0)}%):</span>
+        <input type="range" min="0" max="100" value="${st.vap.desup_v}" oninput="sendCmd('desup='+this.value)">
+      </div>
+      <div class="ctrl-row" style="margin-top:8px;">
+        <button onclick="sendCmd('vap_main=1')">TOGGLE MAIN VAPORIZER</button>
+        <button onclick="sendCmd('vap_force=1')">TOGGLE FORCING VAPORIZER</button>
+      </div>
+    </div>
+  </div>
+  <div class="grid-4">${compCards}</div>`;
+}
+
+function renderManifoldView(st) {
+  const m = st.manifold;
+  const modes = ["0: VOYAGE / CLOSED", "1: SHORE BULK LOADING", "2: SHORE BULK DISCHARGE"];
+  return `<div class="grid-2">
+    <div class="card">
+      <h3>LIQUID MANIFOLD &amp; SHORE VAPOR RETURN</h3>
+      <div class="kv"><span>Active Manifold Mode:</span><span class="ok-text">${modes[m.mode]}</span></div>
+      <div class="kv"><span>Liquid Header Pressure:</span><span>${m.p_liq.toFixed(1)} kPaG</span></div>
+      <div class="kv"><span>Stripping / Spray Header:</span><span>${m.p_strip.toFixed(1)} kPaG</span></div>
+      <div class="kv"><span>Net Shore Liquid Transfer:</span><span>${m.shore_liq_kgs.toFixed(1)} kg/s</span></div>
+      <div class="kv"><span>Shore Vapor Return Pressure:</span><span>${m.p_vap_ret.toFixed(1)} kPaG</span></div>
+      <div class="kv"><span>Shore Vapor Return Flow (HD):</span><span>${m.shore_vap_kgs.toFixed(2)} kg/s</span></div>
+      <div class="kv"><span>Desuperheated Vapor Return Temp:</span><span class="${m.t_vap_ret > -120 ? 'alm-text' : 'ok-text'}">${m.t_vap_ret.toFixed(1)} &deg;C (Limit -120 &deg;C)</span></div>
+      <div class="kv"><span>30s SIGTTO ESD Liquid / Vapor Valves:</span><span>${m.esd_liq_v.toFixed(0)}% / ${m.esd_vap_v.toFixed(0)}%</span></div>
+      <div class="ctrl-row" style="margin-top:10px;">
+        <button onclick="sendCmd('op_mode=0')">VOYAGE CLOSED</button>
+        <button onclick="sendCmd('op_mode=1')">SHORE LOAD</button>
+        <button onclick="sendCmd('op_mode=2')">SHORE DISCHARGE</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>SHORE BOUNDARY &amp; DESUPERHEATER NOTES</h3>
+      <p style="color:var(--muted);line-height:1.5;">
+        During Bulk Loading (Mode 1), displaced vapor and flash gas are drawn by HD Compressors #1/#2 and pushed to the Shore Vapor Return manifold. Keep the Inline Desuperheater spray above 25% so return gas stays colder than -120 &deg;C, otherwise the terminal trips ESD-1.
+      </p>
+    </div>
+  </div>`;
+}
+
+function renderWbtView(st) {
+  const wbt = st.wbt_fill || [15,15,15,15,15,15,15,15,20,35];
+  const rows = WBT_GEOM.map((g, i) =>
+    `<div class="kv"><span>${g.name} (${g.maxVol} m&sup3;):</span><span>${wbt[i].toFixed(1)} % (${(g.maxVol * wbt[i] * 0.01025).toFixed(0)} MT)</span></div>`
+  ).join("");
+  return `<div class="card"><h3>DOUBLE-HULL U-SHAPED WATER BALLAST TANKS (10 TANKS)</h3>${rows}</div>`;
+}
+
+function renderFgdEsdView(st) {
+  return `<div class="grid-2">
+    <div class="card">
+      <h3>SIGTTO ESD-1 INTERLOCK &amp; GAS DETECTION</h3>
+      <div class="kv"><span>ESD-1 System Status:</span><span class="${st.esd1 ? 'alm-text' : 'ok-text'}">${st.esd1 ? 'TRIPPED (' + st.esd_reason + ')' : 'ARMED &amp; NORMAL'}</span></div>
+      <div class="kv"><span>Compressor Motor Room +dP:</span><span>65.0 Pa (Min 25 Pa)</span></div>
+      <div class="kv"><span>Dome Fusible Plug Loop (104 &deg;C):</span><span>${(st.fire_temp || 32.0).toFixed(1)} &deg;C</span></div>
+      <div class="kv"><span>Very Low Tank Pressure Trip:</span><span>&le; 1.50 kPaG</span></div>
+      <div class="kv"><span>High-High Overfill Protection:</span><span>&gt; 98.50 %</span></div>
+      <div class="ctrl-row" style="margin-top:10px;">
+        <button class="btn-danger" onclick="sendCmd('esd=1')">MANUAL ESD-1</button>
+        <button class="btn-danger" onclick="sendCmd('fire_sim=1')">SIMULATE 104&deg;C FIRE PLUG</button>
+        <button class="btn-ok" onclick="sendCmd('esd=0')">RESET ESD</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>BARRIER GAS DETECTION (% VOL CH4 IN IS SPACE)</h3>
+      ${st.tanks.map(t => `<div class="kv"><span>CT${t.id} Primary Insulation Space (IS):</span><span class="${t.is_ch4 > 10 ? 'alm-text' : 'ok-text'}">${t.is_ch4.toFixed(1)} % Vol CH4</span></div>`).join("")}
+    </div>
+  </div>`;
+}
+
+function renderLoadView(st) {
+  const h = st.hydro;
+  return `<div class="grid-2">
+    <div class="card">
+      <h3>20-STATION BONJEAN HYDROSTATICS &amp; LONGITUDINAL STRESS</h3>
+      <div class="kv"><span>Displacement:</span><span>${h.disp.toFixed(0)} MT</span></div>
+      <div class="kv"><span>Drafts (Fwd / Mid / Aft):</span><span>${h.df.toFixed(2)} m / ${h.dm.toFixed(2)} m / ${h.da.toFixed(2)} m</span></div>
+      <div class="kv"><span>Trim / Heel Angle:</span><span>${h.trim.toFixed(2)} m / ${h.heel.toFixed(2)} &deg;</span></div>
+      <div class="kv"><span>Fluid GM0 / Free Surface Corr (FSC):</span><span>${h.gm.toFixed(2)} m (FSC: ${h.fsc.toFixed(2)} m)</span></div>
+      <div class="kv"><span>Max SWSF (Limit 16,500 MT):</span><span class="${h.swsf > 16500 ? 'alm-text' : 'ok-text'}">${h.swsf.toFixed(0)} MT</span></div>
+      <div class="kv"><span>Max SWBM (Limit 380,000 MT&middot;m):</span><span class="${h.swbm > 380000 ? 'alm-text' : 'ok-text'}">${h.swbm.toFixed(0)} MT&middot;m</span></div>
+    </div>
+    <div class="card">
+      <h3>MEMBRANE SLOSHING RESONANCE MONITOR (10% - 70% BARRED)</h3>
+      ${st.tanks.map(t => `<div class="kv"><span>CT${t.id} Fill (${t.fill.toFixed(1)}%):</span><span class="${t.slosh ? 'warn-text' : 'ok-text'}">${t.slosh ? 'BARRED SLOSHING ZONE' : 'APPROVED'}</span></div>`).join("")}
+    </div>
+  </div>`;
+}
+
+function renderBarrierView(st) {
+  return `<div class="grid-4">${st.tanks.map((t, i) => `<div class="card">
+    <h3>CT${t.id} N2 BARRIER SPACES</h3>
+    <div class="kv"><span>Primary Space (IS):</span><span>${t.p_is.toFixed(2)} kPaG</span></div>
+    <div class="kv"><span>Secondary Space (IBS):</span><span>${t.p_ibs.toFixed(2)} kPaG</span></div>
+    <div class="kv"><span>IS Methane Sweep:</span><span class="${t.is_ch4 > 5 ? 'alm-text' : 'ok-text'}">${t.is_ch4.toFixed(1)} % Vol</span></div>
+    <div class="ctrl-row"><button onclick="sendCmd('tank=${i}&leak_tog=1')">SIMULATE MEMBRANE LEAK</button></div>
+  </div>`).join("")}</div>`;
+}
+
+function renderPresetsView(st) {
+  const names = [
+    "0: Laden Voyage (94% LNG, LD1 Auto Fuel Gas)",
+    "1: Shore Bulk Loading (HD1+HD2 to Shore Vapor Return)",
+    "2: Shore Bulk Discharge (8 Main Pumps + Main Vaporizer)",
+    "3: Ballast Spray Cool-Down (Top Spray Rings Active)",
+    "4: Ballast Voyage (3.5% Heel Retention)",
+    "5: Idle Anchorage (Zero ME Demand, GCU Auto Burn)",
+    "6: CT2 Primary Membrane Leak Emergency Drill",
+    "7: Drydock N2 Inerting / Gassing-Up"
+  ];
+  return `<div class="card"><h3>OPERATIONAL SCENARIO PRESETS</h3><div class="grid-2">${names.map((n, i) =>
+    `<button class="${st.preset === i ? 'active' : ''}" style="padding:12px;text-align:left;" onclick="sendCmd('preset=${i}')">${n}</button>`
+  ).join("")}</div></div>`;
+}
+
+function renderOpsDataView(st) {
+  return `<div class="grid-4">${st.tanks.map(t => `<div class="card">
+    <h3>CT${t.id} OPS TELEMETRY</h3>
+    <ul style="list-style:disc;padding-left:18px;line-height:1.65;">
+      <li>Dome Press: <b>${t.p_dome.toFixed(2)} kPaG</b></li>
+      <li>Liq / Vap Temp: <b>${t.t_liq.toFixed(1)} / ${t.t_vap.toFixed(1)} &deg;C</b></li>
+      <li>Membrane Temp: <b>${t.t_mem.toFixed(1)} &deg;C</b></li>
+      <li>Cool Rate: <b>${t.cool_rate.toFixed(1)} &deg;C/h</b></li>
+      <li>Fill / Vol: <b>${t.fill.toFixed(2)}% (${t.vol.toFixed(0)} m&sup3;)</b></li>
+      <li>Cargo Mass: <b>${t.mass.toFixed(1)} MT</b></li>
+      <li>BOR: <b>${t.bor_kgs.toFixed(3)} kg/s</b></li>
+      <li>IS / IBS N2: <b>${t.p_is.toFixed(2)} / ${t.p_ibs.toFixed(2)} kPaG</b></li>
+    </ul>
+  </div>`).join("")}</div>`;
+}
+
+function renderCurrentView(st) {
+  updateTopBar(st);
+  const vp = document.getElementById("viewport");
+  if (activeView === 0) {
+    if (!document.getElementById("webgl-hull")) vp.innerHTML = render3DHullView(st);
+    draw3DHullFrame(st);
+  }
+  else if (activeView <= 4) vp.innerHTML = renderTankView(st, activeView - 1);
+  else if (activeView === 5) vp.innerHTML = renderBogGcuView(st);
+  else if (activeView === 6) vp.innerHTML = renderManifoldView(st);
+  else if (activeView === 7) vp.innerHTML = renderWbtView(st);
+  else if (activeView === 8) vp.innerHTML = renderFgdEsdView(st);
+  else if (activeView === 9) vp.innerHTML = renderLoadView(st);
+  else if (activeView === 10) vp.innerHTML = renderBarrierView(st);
+  else if (activeView === 11) vp.innerHTML = renderPresetsView(st);
+  else vp.innerHTML = renderOpsDataView(st);
+}
+
+initNav();
+setInterval(() => {
+  fetch("/state").then(r => r.json()).then(d => {
+    window.useBackend = true;
+    window.latestState = Object.assign(window.simEngine.state, d);
+    renderCurrentView(window.latestState);
+  }).catch(() => {
+    window.useBackend = false;
+    window.simEngine.step(0.5);
+    renderCurrentView(window.simEngine.state);
+  });
+}, 500);
+
+</script>
+</body>
+</html>

@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>174k m3 LNGC Membrane Cargo &amp; Ballast Simulator</title>
+<style>
+  :root {
+    --bg: #070c14; --panel: #0e1726; --border: #1e2f4d;
+    --text: #d8e6f8; --muted: #7b93b2; --cyan: #00d4ff;
+    --green: #00e676; --amber: #ffab00; --red: #ff3d57;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: monospace; }
+  body { background: var(--bg); color: var(--text); padding: 8px; font-size: 13px; }
+  .topbar {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    justify-content: space-between; background: var(--panel);
+    border: 1px solid var(--border); padding: 8px 12px; border-radius: 4px;
+  }
+  .brand { font-size: 15px; font-weight: bold; color: var(--cyan); }
+  .telemetry-strip { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  .badge {
+    padding: 3px 8px; border-radius: 3px; font-weight: bold;
+    background: #132238; border: 1px solid var(--border);
+  }
+  .esd-ok { background: #06331e; color: var(--green); border-color: var(--green); }
+  .esd-trip { background: #4a0a14; color: #fff; border-color: var(--red); animation: blink 0.8s infinite; }
+  @keyframes blink { 50% { opacity: 0.35; } }
+  .navbar {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+    gap: 5px; margin: 8px 0;
+  }
+  button {
+    background: #132036; color: var(--text); border: 1px solid var(--border);
+    padding: 7px 6px; border-radius: 3px; cursor: pointer; font-weight: bold;
+  }
+  button:hover { border-color: var(--cyan); }
+  button.active { background: #00456b; border-color: var(--cyan); color: #fff; }
+  button.btn-danger { background: #520c18; border-color: var(--red); color: #fff; }
+  button.btn-ok { background: #0a3d24; border-color: var(--green); color: var(--green); }
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 10px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 8px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 4px; padding: 10px;
+  }
+  .card h3 { color: var(--cyan); font-size: 13px; margin-bottom: 8px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+  .kv { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px dashed #15233b; }
+  .kv span:last-child { font-weight: bold; color: #fff; }
+  .ctrl-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; }
+  input[type=range] { flex: 1; accent-color: var(--cyan); }
+  svg { width: 100%; height: auto; background: #060a10; border: 1px solid #16243b; border-radius: 4px; }
+  .alm-text { color: var(--red); font-weight: bold; }
+  .warn-text { color: var(--amber); font-weight: bold; }
+  .ok-text { color: var(--green); font-weight: bold; }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <div>
+      <span class="brand">GTT MARK III FLEX &mdash; 174,000 m&sup3; LNGC SIMULATOR</span>
+      <span id="backend-tag" class="badge" style="margin-left:6px;">SYNCING</span>
+    </div>
+    <div class="telemetry-strip">
+      <span class="badge">TIME: <span id="tb-time">0.0</span>s</span>
+      <span class="badge">DOME AVG: <span id="tb-pdome">11.50</span> kPaG</span>
+      <span class="badge">ME FUEL: <span id="tb-mefuel">0.95</span> kg/s</span>
+      <span id="tb-esd" class="badge esd-ok">ESD-1: NORMAL</span>
+      <button class="btn-danger" onclick="sendCmd('esd=1')">ESD-1 TRIP</button>
+      <button class="btn-ok" onclick="sendCmd('esd=0')">RESET ESD</button>
+    </div>
+  </div>
+
+  <div class="navbar" id="navbar"></div>
+  <div id="viewport"></div>
+
+  <script src="standalone_sim.js"></script>
+  <script src="ui_3d.js"></script>
+  <script src="ui_mimics.js"></script>
+</body>
+</html>
